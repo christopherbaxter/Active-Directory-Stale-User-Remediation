@@ -1,0 +1,651 @@
+# Disable and Delete Stale Active Directory User Accounts Safely
+
+Managing stale user accounts in Active Directory sounds simple. Find the accounts that have not been used, disable them, wait for an agreed period, and then delete them.
+
+Simple, right?
+
+Well, not really.
+
+The challenge is not running `Disable-ADAccount` or `Remove-ADUser`. The challenge is making sure that the account in front of you is actually stale, is not a service or privileged account, has not suddenly become active again, is not on an approved exclusion list, and is genuinely ready for the action you are about to perform.
+
+This script was created as the second part of my stale-user management process. The reporting script identifies and classifies the accounts. This remediation script imports that report, applies a separate exclusions file, checks the live Active Directory object again, and then either disables an approved stale user or deletes a validated disabled-stale user.
+
+The script can be found here:
+
+```text
+scripts/Invoke-HybridStaleUserRemediation.ps1
+```
+
+# Before you run this script!
+
+This script can disable and delete Active Directory user accounts.
+
+Please do not point it at a production report, add `-Execute`, and hope for the best.
+
+The script runs in preview mode by default. Keep it that way until you have reviewed the candidate report, tested the exclusions, investigated the skipped accounts, and confirmed the expected results in a non-production environment.
+
+The remediation process should only begin after the stale-user report has been generated and reviewed. The report is an input into the process. It is not automatic approval to modify an account.
+
+# What is needed for this script to function?
+
+You will need:
+
+- The Active Directory PowerShell module
+- Read access to the forest, domains, domain controllers, and user attributes
+- Delegated permission to disable the approved accounts
+- Delegated permission to delete the approved accounts
+- Network access to the writable domain controllers in each source domain
+- A recent stale-user CSV report
+- A reviewed semicolon-delimited exclusions file
+- A secure folder for the remediation output
+- A tested recovery process
+- An approved change record before live execution
+
+The script does not require Microsoft Graph because it consumes the Microsoft Entra information that was already written into the stale-user report.
+
+The script does not modify:
+
+- Microsoft Entra ID users
+- Microsoft 365 licences
+- Mailboxes
+- Sessions
+- Group membership
+- Home folders
+- User profiles
+- File ownership
+- Application data
+
+Those processes need to be managed separately.
+
+# Disclaimer
+
+Ok, so this is the important part.
+
+This example was generated with the assistance of AI, using generalised ideas and patterns from scripts and processes I have worked with previously. It is not a copy of a production script and contains no customer names, domains, accounts, object IDs, server names, or environment-specific information.
+
+I have statically reviewed the code and logic, but I have not tested this public version against a live Active Directory forest. Your environment will be different from mine. Permissions, replication, object protection, report formats, PowerShell versions, and directory design can all affect the result.
+
+Please test the script properly before using it. Start with preview mode. Use `-WhatIf`. Review every output file. Make sure that you understand why every account is in the disablement or deletion list.
+
+Deletion is destructive. Active Directory Recycle Bin helps, but only when it was enabled before the account was deleted and the object is still within the applicable retention period.
+
+# Christopher, enough ramble, how does this thing work?
+
+The script has two jobs:
+
+1. Disable enabled stale-user accounts.
+2. Delete disabled-stale accounts that have passed the additional validation.
+
+I have deliberately kept the reporting and remediation scripts separate. This gives us a review point between identifying an account and changing it.
+
+The flow looks like this:
+
+```text
+Generate report
+    ↓
+Review candidates
+    ↓
+Update exclusions
+    ↓
+Run remediation preview
+    ↓
+Investigate skipped and failed accounts
+    ↓
+Run with -Execute -WhatIf
+    ↓
+Obtain approval
+    ↓
+Disable approved stale users
+    ↓
+Delete only validated disabled-stale users
+```
+
+## The Parameters
+
+The main parameters are:
+
+```powershell
+-ReportPath
+-ExclusionPath
+-OutputPath
+-Mode
+-DisabledRetentionDays
+-MaximumReportAgeDays
+-Execute
+-AllowOldReport
+-AllowLegacyReport
+-AllowDeleteWithoutRecycleBin
+```
+
+### `ReportPath`
+
+This is the CSV output from the stale-user reporting script.
+
+The modern report should include these fields for disablement:
+
+```text
+ADObjectGUID
+SamAccountName
+SourceDomain
+Classification
+ADEnabled
+ADStale
+EntraStale
+AccountOldEnough
+OnPremisesSyncEnabled
+IsExcluded
+ServiceAccountCandidate
+```
+
+For deletion, the report also needs:
+
+```text
+DisabledStale
+DCValidationStatus
+```
+
+### `ExclusionPath`
+
+This is the semicolon-delimited exclusions file.
+
+I prefer to match exclusions by `ADObjectGUID` because account names can change. The script can also use `SamAccountName` as a secondary match.
+
+A sample looks like this:
+
+```csv
+ADObjectGUID;SamAccountName;Reason;Owner;ReviewDate
+00000000-0000-0000-0000-000000000000;;Emergency access identity;Identity Operations;2027-01-31
+;example-service;Application dependency;Application Owner;2027-03-31
+```
+
+These values are fictional. Do not upload your completed exclusions file to GitHub.
+
+### `Mode`
+
+The available modes are:
+
+```powershell
+-Mode Disable
+```
+
+```powershell
+-Mode Delete
+```
+
+```powershell
+-Mode Both
+```
+
+I would normally run disablement and deletion separately. It makes the change easier to review and gives you cleaner evidence for each action.
+
+### `DisabledRetentionDays`
+
+This is the age threshold used when the script revalidates a disabled-stale user before deletion.
+
+The default is:
+
+```powershell
+-DisabledRetentionDays 180
+```
+
+This is an example framework value, not a universal Microsoft requirement. Set it according to your approved identity lifecycle and retention policy.
+
+### `MaximumReportAgeDays`
+
+The script refuses an old report by default.
+
+```powershell
+-MaximumReportAgeDays 7
+```
+
+Seven days is a safety choice for this framework, not a Microsoft requirement. A fresh report is always better because accounts and exclusions can change after the report is generated.
+
+### `Execute`
+
+Without this switch, the script remains in preview mode.
+
+```powershell
+-Execute
+```
+
+Adding `-Execute` allows the script to reach the actual AD change commands, but `-WhatIf` and `-Confirm` still work.
+
+### The override switches
+
+The framework includes:
+
+```powershell
+-AllowOldReport
+-AllowLegacyReport
+-AllowDeleteWithoutRecycleBin
+```
+
+These are not convenience switches.
+
+Each one weakens a safety boundary and should require a documented reason and approval. In particular, `-AllowDeleteWithoutRecycleBin` accepts that normal Recycle Bin recovery will not be available.
+
+## The Functions
+
+The functions are included in the script.
+
+They handle:
+
+- Boolean conversion from CSV values
+- Flexible report-column lookup
+- Built-in SID detection
+- Directory retention discovery
+- Live cross-DC validation
+- Action-result logging
+
+The important idea is that the script does not simply trust a row in a CSV file. It uses the immutable AD object GUID to find the live account again.
+
+## Importing the report and exclusions
+
+The script imports the report as a normal CSV and the exclusions as a semicolon-delimited CSV.
+
+It then builds exclusion indexes for GUID and SAM account name matching.
+
+If an account is excluded in either the report or the external exclusions file, it does not enter the normal disablement or deletion process.
+
+This is important because the exclusions file becomes the persistent record of accounts that should not be touched by the automated workflow.
+
+## Selecting accounts for disablement
+
+The modern disablement selection expects:
+
+```text
+Classification = Enabled stale candidate - owner validation required
+ADEnabled = True
+ADStale = True
+EntraStale = True
+AccountOldEnough = True
+OnPremisesSyncEnabled = True
+```
+
+The account must also not be:
+
+- Explicitly excluded
+- Marked as excluded in the report
+- Marked as a service-account candidate
+
+The script then reads the live AD user again.
+
+It skips the account when the live object shows:
+
+- The account is already disabled
+- The SID ends in RID 500, 501, or 502
+- `PasswordNeverExpires` is enabled
+- The account has one or more SPNs
+- `adminCount` is `1`
+
+If the account passes the live checks, preview mode records:
+
+```text
+PreviewWouldDisable
+```
+
+During an approved live run, the script uses:
+
+```powershell
+Disable-ADAccount
+```
+
+It then reads the account again and confirms that it is disabled.
+
+## Selecting accounts for deletion
+
+Deletion is where I become far more conservative.
+
+The report must show:
+
+```text
+DisabledStale = True
+DCValidationStatus = ValidatedAgainstAllWritableDCs
+```
+
+Even then, the script does not immediately delete the account.
+
+It first performs the cross-DC checks again.
+
+### Cross-DC validation
+
+For every deletion candidate, the script:
+
+1. Finds every writable DC returned for the source domain.
+2. Queries the user by object GUID on each DC.
+3. Records every successful and failed query.
+4. Checks the live enabled state on every successful query.
+5. Selects the most recent local `whenChanged` value returned.
+6. Compares that value with the current deletion cutoff.
+
+If any returned writable DC cannot be queried, the account is skipped.
+
+If any DC says that the account is enabled, the account is skipped.
+
+If the newest `whenChanged` value is too recent, the account is skipped.
+
+This is fail-closed behavior. I would rather have an account remain disabled for another review cycle than delete it using incomplete evidence.
+
+### The live protection checks
+
+Before deletion, the script checks the live object again and skips it when:
+
+- The account is enabled
+- The account is protected from accidental deletion
+- The SID is a built-in RID
+- `PasswordNeverExpires` is enabled
+- One or more SPNs exist
+- `adminCount` is `1`
+
+If the account passes every check, preview mode records:
+
+```text
+PreviewWouldDelete
+```
+
+During an approved live run, the script uses:
+
+```powershell
+Remove-ADUser
+```
+
+I deliberately use `Remove-ADUser` rather than a recursive `Remove-ADObject`. This workflow is intended to remove a validated user object, not recursively remove child objects.
+
+After the command, the script checks the target DC again and confirms that the live user object is no longer returned.
+
+# Running the script
+
+## Preview both actions
+
+This is where I would start:
+
+```powershell
+.\scripts\Invoke-HybridStaleUserRemediation.ps1 `
+    -ReportPath "C:\SecureInput\All-Hybrid-Users.csv" `
+    -ExclusionPath "C:\SecureInput\UserExclusions.csv" `
+    -OutputPath "C:\SecureOutput" `
+    -Mode Both
+```
+
+No accounts are changed.
+
+## Preview with PowerShell `WhatIf`
+
+```powershell
+.\scripts\Invoke-HybridStaleUserRemediation.ps1 `
+    -ReportPath "C:\SecureInput\All-Hybrid-Users.csv" `
+    -ExclusionPath "C:\SecureInput\UserExclusions.csv" `
+    -OutputPath "C:\SecureOutput" `
+    -Mode Both `
+    -Execute `
+    -WhatIf
+```
+
+This reaches the `ShouldProcess` logic while still preventing changes.
+
+## Disable approved stale users
+
+```powershell
+.\scripts\Invoke-HybridStaleUserRemediation.ps1 `
+    -ReportPath "C:\SecureInput\All-Hybrid-Users.csv" `
+    -ExclusionPath "C:\SecureInput\UserExclusions.csv" `
+    -OutputPath "C:\SecureOutput" `
+    -Mode Disable `
+    -Execute `
+    -Confirm
+```
+
+## Delete validated disabled-stale users
+
+```powershell
+.\scripts\Invoke-HybridStaleUserRemediation.ps1 `
+    -ReportPath "C:\SecureInput\All-Hybrid-Users.csv" `
+    -ExclusionPath "C:\SecureInput\UserExclusions.csv" `
+    -OutputPath "C:\SecureOutput" `
+    -Mode Delete `
+    -DisabledRetentionDays 180 `
+    -Execute `
+    -Confirm
+```
+
+# The reports created by the script
+
+The script creates several output files.
+
+## Candidate selection
+
+```text
+Candidate-Selection-<timestamp>.csv
+```
+
+This shows which report rows were selected for disablement or deletion and which exclusions were applied.
+
+## Directory retention
+
+```text
+Directory-Retention-<timestamp>.csv
+```
+
+This records:
+
+- Recycle Bin status
+- Enabled scopes
+- Configured tombstone lifetime
+- Effective tombstone lifetime
+- Configured deleted-object lifetime
+- Effective deleted-object lifetime
+
+## Remediation actions
+
+```text
+Remediation-Actions-<timestamp>.csv
+```
+
+This is the main action and error report.
+
+It records:
+
+- The requested action
+- The outcome
+- Live state before action
+- Skip reason
+- Validation status
+- Latest `whenChanged` observation
+- Error information
+
+## Deletion DC validation
+
+```text
+Deletion-DC-Validation-<timestamp>.csv
+```
+
+This contains one observation per deletion candidate per queried DC.
+
+## Remediation summary
+
+```text
+Remediation-Summary-<timestamp>.csv
+```
+
+This provides the run-level totals for candidates, preview actions, successful actions, skipped accounts, and failures.
+
+Do not upload these output files to GitHub. They contain real identity and directory information.
+
+# Now for the AD Recycle Bin bit
+
+It is very easy to say that a deleted account will remain recoverable for six months. It is not that simple.
+
+Active Directory Recycle Bin is not enabled by default. It must have been enabled before the account was deleted. Microsoft also states that enabling it is irreversible.
+
+When it is enabled, deleted AD objects retain the information needed for a much more complete restoration, including link-valued attributes such as group memberships.
+
+The script checks Recycle Bin with:
+
+```powershell
+Get-ADOptionalFeature `
+    -Identity "Recycle Bin Feature" `
+    -Properties EnabledScopes
+```
+
+If Recycle Bin is not enabled, live deletion is blocked unless the following override is deliberately supplied:
+
+```powershell
+-AllowDeleteWithoutRecycleBin
+```
+
+Again, this is not a recommendation. It is a deliberate risk-acceptance path.
+
+# Tombstone lifetime and deleted-object lifetime
+
+Two values are important here.
+
+## `msDS-DeletedObjectLifetime`
+
+With Recycle Bin enabled, this controls how long an object remains in the deleted state before it becomes recycled.
+
+If this value is not configured, it follows the effective tombstone lifetime.
+
+## `tombstoneLifetime`
+
+This controls deleted-object cleanup behavior when Recycle Bin is not enabled, and the recycled-object phase when it is enabled.
+
+You may see both 60 days and 180 days described as defaults.
+
+The protocol documentation describes 60 days when the attribute is unset. Microsoft's current lingering-object guidance states that forests created using currently supported Windows Server versions have a default TSL of 180 days. Upgrading domain controllers does not automatically change an existing forest value.
+
+So, which one do you use?
+
+Neither, without checking.
+
+Query the actual forest.
+
+```powershell
+$RootDse = Get-ADRootDSE
+
+$DirectoryServiceDn = `
+    "CN=Directory Service,CN=Windows NT,CN=Services," +
+    $RootDse.ConfigurationNamingContext
+
+Get-ADObject `
+    -Identity $DirectoryServiceDn `
+    -Properties tombstoneLifetime, msDS-DeletedObjectLifetime
+```
+
+The remediation script performs this check at the start of every run and writes the result to the directory-retention report.
+
+# Restoring an account
+
+If Recycle Bin was enabled before deletion and the object is still within the restorable period, deleted objects can be found with:
+
+```powershell
+Get-ADObject `
+    -Filter 'isDeleted -eq $true' `
+    -IncludeDeletedObjects `
+    -Properties lastKnownParent, msDS-LastKnownRDN
+```
+
+A selected object can then be passed to:
+
+```powershell
+Restore-ADObject
+```
+
+Restoration should still be an approved change.
+
+After a restore, validate:
+
+- The restored location
+- The account's enabled state
+- Group memberships
+- Privileged access
+- Mailbox and application dependencies
+- The reason the account was removed
+- Whether the account should genuinely return to service
+
+# HUGE CAVEAT
+
+## `whenChanged` is not a disablement date
+
+The deletion logic uses `whenChanged` as a conservative object-change age indicator.
+
+It does not tell us:
+
+- Which attribute changed
+- Who changed it
+- Why it changed
+- Whether the change disabled the account
+- Whether the account remained disabled continuously
+
+The value is also not replicated. Each DC can return a different local value.
+
+That is why the script queries every returned writable DC and uses the most recent value it receives. Even then, it is still an object-change indicator and not an authoritative disablement timestamp.
+
+If you need an authoritative disablement date, record the disablement event in your change-management or identity-governance process.
+
+# What this script intentionally refuses to do
+
+The script refuses to:
+
+- Delete from `DisabledStale = True` alone
+- Delete when cross-DC validation is incomplete
+- Delete an enabled account
+- Delete RID 500, 501, or 502
+- Delete an account with an SPN
+- Delete an account with a non-expiring password
+- Delete an `adminCount = 1` account
+- Delete an account protected from accidental deletion
+- Delete without Recycle Bin unless explicitly overridden
+- Process an old report unless explicitly overridden
+- Modify anything unless `-Execute` is supplied
+
+I would rather have a false negative that remains for manual review than a false positive that gets deleted.
+
+# So, what is the recommended process?
+
+This is the sequence I recommend:
+
+1. Generate a fresh stale-user report.
+2. Review the possible user, mailbox, service, and privileged accounts.
+3. Update and approve the exclusions file.
+4. Run the remediation script in preview mode.
+5. Review every `PreviewWouldDisable` and `PreviewWouldDelete` result.
+6. Investigate every skipped and failed account.
+7. Run again with `-Execute -WhatIf`.
+8. Obtain the required change approval.
+9. Run disablement separately.
+10. Verify the disabled accounts and dependent services.
+11. Allow the approved retention period to pass.
+12. Generate a fresh report again.
+13. Run deletion only for validated disabled-stale users.
+14. Securely retain the audit output.
+15. Reconcile AD changes with Microsoft Entra ID, Exchange, licensing, data ownership, HR, and identity governance processes.
+
+# Final thoughts
+
+The report is not the decision.
+
+The exclusions file is not the decision.
+
+The script is not the decision.
+
+They are all controls that help us execute an already reviewed and approved identity-lifecycle decision consistently.
+
+For every account, I want to be able to answer:
+
+1. Why was this account selected?
+2. What live evidence was checked?
+3. Why was the account not excluded?
+4. Who approved the action?
+5. What evidence shows that the action succeeded?
+6. How will we recover the account if the decision was wrong?
+
+If we cannot answer those questions, then the account is not ready for automated remediation.
+
+# Microsoft documentation
+
+- [Disable-ADAccount](https://learn.microsoft.com/en-us/powershell/module/activedirectory/disable-adaccount?view=windowsserver2025-ps)
+- [Remove-ADUser](https://learn.microsoft.com/en-us/powershell/module/activedirectory/remove-aduser?view=windowsserver2025-ps)
+- [Enable and use Active Directory Recycle Bin](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/adac/active-directory-recycle-bin)
+- [Tombstone lifetime and deleted-object lifetime](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/1887de08-2a9e-4694-95e2-898cde411180)
+- [Lingering objects and tombstone-lifetime guidance](https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/information-lingering-objects)
+- [Restore-ADObject](https://learn.microsoft.com/en-us/powershell/module/activedirectory/restore-adobject?view=windowsserver2025-ps)
