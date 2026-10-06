@@ -1,0 +1,43 @@
+# Generated remediation reports
+Candidate-Selection-*.csv
+Directory-Retention-*.csv
+Remediation-Actions-*.csv
+Deletion-DC-Validation-*.csv
+Remediation-Summary-*.csv
+
+# Production input and exclusion data
+*UserExclusions.csv
+!examples/UserExclusions.example.csv
+All-Hybrid-Users*.csv
+*Stale*Users*.csv
+
+# PowerShell transcripts and logs
+PowerShell_transcript.*
+*.log
+*.etl
+*.evtx
+
+# Secrets and local configuration
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+*.pem
+*.secret
+*.secrets
+.env
+.env.*
+config.local.*
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.old
+*~
